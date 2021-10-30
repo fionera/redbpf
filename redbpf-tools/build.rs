@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use cargo_bpf_lib as cargo_bpf;
 
 fn main() {
+    println!("cargo:rerun-if-changed=probes/");
+
     let cargo = PathBuf::from(env::var("CARGO").unwrap());
     let target = PathBuf::from(env::var("OUT_DIR").unwrap());
     let probes = Path::new("probes");
