@@ -8,213 +8,191 @@
 /*!
 Types and traits for working with networking data.
 
-The main trait exported by this module is `NetworkBuffer`. It's implemented by
-[`XdpContext`](../../redbpf_probes/xdp/struct.XdpContext.html) to provide
-access to the network data.
+The main trait exported by this module is `NetworkBuffer`. It's implemented
+by
+[`XdpContext`](https://ingraind.org/api/redbpf_probes/xdp/struct.XdpContext.html)
+to provide access to the network data.
  */
-use crate::bindings::*;
-use core::mem;
-use core::slice;
-use cty::*;
-use redbpf_macros::impl_network_buffer_array;
 
-/// The packet transport header.
+mod buf;
+pub mod error;
+mod layer2;
+mod layer3;
+mod layer4;
+pub mod socket;
+pub mod socket_filter;
+pub mod tc;
+pub mod xdp;
+
+/// A convienience prelude to glob import all supported protocols.
+pub mod protocols {
+    pub use super::layer2::*;
+    pub use super::layer3::*;
+    pub use super::layer4::*;
+}
+
+use crate::net::{
+    buf::{NetBuf, RawBuf},
+    error::Result,
+};
+
+/// A marker trait to mark types thats are aligned (have an alignment of 1).
 ///
-/// Currently only `TCP` and `UDP` transports are supported.
-pub enum Transport {
-    TCP(*const tcphdr),
-    UDP(*const udphdr),
+/// Types can be marked to have an alignment of 1 either via `#[repr(align(1))]`
+/// or `#[repr(C, packed)]`. A struct marked as `Unaligned` should also require
+/// that all fields are `Unaligned` as well.
+pub unsafe trait Unaligned {}
+
+pub trait FromBe {
+    fn from_be(&self) -> Self;
 }
 
-impl Transport {
-    /// Returns the source port.
-    #[inline]
-    pub fn source(&self) -> u16 {
-        let source = match *self {
-            Transport::TCP(hdr) => unsafe { (*hdr).source },
-            Transport::UDP(hdr) => unsafe { (*hdr).source },
-        };
-        u16::from_be(source)
-    }
-
-    /// Returns the destination port.
-    #[inline]
-    pub fn dest(&self) -> u16 {
-        let dest = match *self {
-            Transport::TCP(hdr) => unsafe { (*hdr).dest },
-            Transport::UDP(hdr) => unsafe { (*hdr).dest },
-        };
-        u16::from_be(dest)
-    }
-}
-
-pub enum NetworkError {
-    Other,
-    OutOfBounds,
-    NoIPHeader,
-    UnsupportedTransport(u32),
-}
-
-pub type NetworkResult<T> = Result<T, NetworkError>;
-
-pub trait NetworkBuffer
-where
-    Self: Clone + Sized,
-{
-    fn data_start(&self) -> usize;
-    fn data_end(&self) -> usize;
-
-    /// Returns the packet length.
-    #[inline]
-    fn len(&self) -> usize {
-        self.data_end() - self.data_start()
-    }
-
-    /// Returns a raw pointer to a given address inside the buffer.
-    ///
-    /// # Safety
-    ///
-    /// This method uses `NetworkBuffer::check_bounds` to ensure the given address
-    /// `addr` is within the buffer and allows enough following space to point
-    /// to something of type `U`. However no checks are done to ensure the
-    /// returned pointer points to a valid bit pattern of type `U`, nor are any
-    /// alignments checked. Ensuring proper alignment is followed and pointed to
-    /// address is a valid bit pattern of type `U` is left up to the caller.
-    #[inline]
-    unsafe fn ptr_at<U>(&self, addr: usize) -> NetworkResult<*const U> {
-        self.check_bounds(addr, addr + mem::size_of::<U>())?;
-
-        Ok(addr as *const U)
-    }
-    /// Returns a raw pointer to the address following `prev` plus the size of a `T`
-    ///
-    /// # Safety
-    ///
-    /// This method uses `NetworkBuffer::check_bounds` to ensure the given address
-    /// `addr` is within the buffer and allows enough following space to point
-    /// to something of type `U`. However no checks are done to ensure the
-    /// returned pointer points to a valid bit pattern of type `U`, nor are any
-    /// alignments checked. Ensuring proper alignment is followed and pointed to
-    /// address is a valid bit pattern of type `U` is left up to the caller.
-    #[inline]
-    unsafe fn ptr_after<T, U>(&self, prev: *const T) -> NetworkResult<*const U> {
-        self.ptr_at(prev as usize + mem::size_of::<T>())
-    }
-
-    #[inline]
-    fn check_bounds(&self, start: usize, end: usize) -> NetworkResult<()> {
-        if start >= end {
-            return Err(NetworkError::OutOfBounds);
-        }
-
-        if start < self.data_start() as usize {
-            return Err(NetworkError::OutOfBounds);
-        }
-
-        if end > self.data_end() as usize {
-            return Err(NetworkError::OutOfBounds);
-        }
-
-        Ok(())
-    }
-
-    /// Returns the packet's `Ethernet` header if present.
-    #[inline]
-    fn eth(&self) -> NetworkResult<*const ethhdr> {
-        unsafe { self.ptr_at(self.data_start() as usize) }
-    }
-
-    /// Returns the packet's `IP` header if present.
-    #[inline]
-    fn ip(&self) -> NetworkResult<*const iphdr> {
-        let eth = self.eth()?;
-        unsafe {
-            if (*eth).h_proto != u16::from_be(ETH_P_IP as u16) {
-                return Err(NetworkError::NoIPHeader);
+macro_rules! impl_from_be {
+    ($T:ty) => {
+        impl FromBe for $T {
+            #[inline(always)]
+            fn from_be(&self) -> $T {
+                <$T>::from_be(*self)
             }
-
-            self.ptr_after(eth)
         }
-    }
-
-    /// Returns the packet's transport header if present.
-    #[inline]
-    fn transport(&self) -> NetworkResult<Transport> {
-        unsafe {
-            let ip = self.ip()?;
-            let addr = ip as usize + ((*ip).ihl() * 4) as usize;
-            let transport = match (*ip).protocol as u32 {
-                IPPROTO_TCP => (Transport::TCP(self.ptr_at(addr)?)),
-                IPPROTO_UDP => (Transport::UDP(self.ptr_at(addr)?)),
-                t => return Err(NetworkError::UnsupportedTransport(t)),
-            };
-
-            Ok(transport)
-        }
-    }
-
-    /// Returns the packet's data starting after the transport headers.
-    #[inline]
-    fn data(&self) -> NetworkResult<Data<Self>> {
-        use Transport::*;
-        unsafe {
-            let base: *const c_void = match self.transport()? {
-                TCP(hdr) => {
-                    let addr = hdr as usize + ((*hdr).doff() * 4) as usize;
-                    self.ptr_at(addr)
-                }
-                UDP(hdr) => self.ptr_after(hdr),
-            }?;
-
-            let ctx: Self = self.clone();
-            Ok(Data {
-                ctx,
-                base: base as usize,
-            })
-        }
-    }
+    };
 }
 
-/// Data type returned by calling `NetworkBuffer::data()`
-pub struct Data<T: NetworkBuffer> {
-    ctx: T,
-    base: usize,
-}
+impl_from_be!(u8);
+impl_from_be!(u16);
+impl_from_be!(u32);
 
-impl<T: NetworkBuffer> Data<T> {
-    /// Returns the offset from the first byte of the packet.
-    #[inline]
-    pub fn offset(&self) -> usize {
-        self.base - self.ctx.data_start()
+/// A `Packet` is an abstract idea of bytes coming off the wire making a network
+/// message. `Packet`s are recursive (i.e. they encapsulate other `Packet`s).
+///
+/// An example is an [`Ethernet`] frame which then encapsulates an [`Ipv4`]
+/// packet, which further encapsulates a [`Tcp`] a segment, finllay containing
+/// some application payload.
+///
+/// ```no_run
+/// +-------------------------------+
+/// | Ethernet | IP | TCP | Payload |
+/// +-------------------------------+
+/// ```
+///
+/// All implementors of this trait contain an underlying buffer ([`DataBuf`])
+/// which represents the actual bytes on the wire. In some BPF contexts the
+/// bytes in the buffer are the actual bytes from the network packet and thus
+/// directly mutable while in other contexts the bytes only represent the in
+/// kernel bytes and must be mutated via BPF helper functions.
+///
+/// This trait consists of several methods, one to access and pass on the
+/// underlying buffer in order to pass it down the stack into the encapsulated
+/// packet.
+///
+/// Another to "parse" the bytes at the current position of the buffer as some
+/// further encapsulated packets. For example, if we have an [`Ethernet`] frame,
+/// and call [`Packet::parse<Ipv4>`] (requesting an [`Ipv4`] packet), the bytes
+/// at the current position of the underlying buffer are interpretted as the
+/// requested packet type, and the position in the buffer is advanced to the end
+/// of requested packet header.
+///
+/// ```
+/// Currently have an Ethernet frame:
+///
+/// +-------------------------------+
+/// | Ethernet | IP | TCP | Payload |
+/// +-------------------------------+
+///            ^~~ Current position
+///
+/// After calling Ethernet::parse<Ipv4>()
+///
+/// +-------------------------------+
+/// | Ethernet | IP | TCP | Payload |
+/// +-------------------------------+
+///                 ^~~ Current position
+///
+/// After calling Ipv4::parse<Tcp>()
+///
+/// +-------------------------------+
+/// | Ethernet | IP | TCP | Payload |
+/// +-------------------------------+
+///                       ^~~ Current position
+/// ```
+///
+/// The `Packet::parse` method is fallible so that if the requested packet type
+/// does not match the bytes in the buffer, the caller can be notified. However,
+/// not all implementors have good methods to determine if the bytes in the
+/// buffer match the requested type (assuming the buffer contains at least
+/// enough remaining bytes to satisfy the request). Such an example would be
+/// when requesting a [`Ethernet`] frame from a bare [`DataBuf`]. In such
+/// circumstances it is up to the caller to ensure the returned structure is a
+/// valid instance of the requested type.
+///
+/// In order to implement [`Packet::parse`] the requested type must meet a few invariants:
+///
+/// * Must have an alignment of 1 (or use `#[repr(C, packed)]`, which uses an
+///   alignment of 1)
+/// * Must also implement `Packet`
+pub trait Packet<'a, T>: Sized
+where
+    T: RawBuf + 'a,
+{
+    type Encapsulated;
+
+    /// Give up ownership of the underlying buffer where the cursor is currently
+    /// pointing to body/next header.
+    fn buf(self) -> NetBuf<'a, T>;
+
+    /// Give a reference to the underlying buffer where the cursor is currently
+    /// pointing to body/next header.
+    fn buf_ref(&self) -> &NetBuf<'a, T>;
+
+    /// Returns the offset from the start of the underlying buffer to the current 
+    /// packet body/next header
+    fn offset(&self) -> usize;
+
+    /// Returns a slice to the body of the packet
+    fn body(&self) -> &[u8];
+
+    /// Returns the length (in bytes) the packet body
+    /// 
+    /// Equivalent to the underlying buffer length minus all currently parsed headers
+    fn len(&self) -> usize;
+
+    /// Interprets the first `size_of::<U>()` bytes in this buffer as some type
+    /// `U`, "consuming" `size_of::<U>()` bytes from the buffer.
+    #[inline(always)]
+    fn parse_as<U>(self) -> Result<U>
+    where
+        U: FromBytes<'a, T>,
+    {
+        U::from_bytes(self.buf())
     }
 
-    /// Returns the length of the data.
+    /// Parses the next bytes of a [`NetBuf`] as some further encapsulated
+    /// packet type.
     ///
-    /// This is equivalent to the length of the packet minus the length of the headers.
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.ctx.data_end() - self.base
-    }
-
-    /// Returns a `slice` of `len` bytes from the data.
-    #[inline]
-    pub fn slice(&self, len: usize) -> NetworkResult<&[u8]> {
-        unsafe {
-            self.ctx.check_bounds(self.base, self.base + len)?;
-            let s = slice::from_raw_parts(self.base as *const u8, len);
-            Ok(s)
-        }
-    }
-
-    #[inline]
-    pub fn read<U: NetworkBufferArray>(&self) -> NetworkResult<U> {
-        unsafe {
-            let len = mem::size_of::<U>();
-            self.ctx.check_bounds(self.base, self.base + len)?;
-            Ok((self.base as *const U).read_unaligned())
-        }
-    }
+    /// Implementors should perform all safety to checks to ensure that the
+    /// bytes being parsed represent a valid return type, and check all bounds.
+    ///
+    /// If multiple inner packet types are possible (such as Ethernet can
+    /// encapsulate both TCP or UDP) then `Packet::Encapsulated` should be an
+    /// enum which contains variants for all supported encapsulated protocols.
+    ///
+    /// For example, if we have a [`Ethernet`] and are unsure whether the next
+    /// encapsulated packet is a [`Tcp`] or [`Udp`], but this can be determined
+    /// by looking at [`Ethernet::proto`]. This method is implemented on
+    /// [`Ethernet`] in such a manner as to look at the `proto` field and return
+    /// the correct variant based on the `proto` value.
+    ///
+    /// **PRO TIP:** If `Packet::Encapsulated` could potentially have additional
+    /// protocols or variants added later it should be a [non-exhaustive][0]
+    /// enums, or hidden variants (`#[doc(hidden)]`) if required to support a
+    /// `rustc` older than 1.40.
+    ///
+    /// [0]: https://doc.rust-lang.org/reference/attributes/type_system.html#the-non_exhaustive-attribute
+    fn parse(self) -> Result<Self::Encapsulated>;
 }
 
-pub trait NetworkBufferArray {}
-impl_network_buffer_array!();
+pub unsafe trait FromBytes<'a, T>: Sized
+where
+    T: RawBuf + 'a,
+{
+    fn from_bytes(buf: NetBuf<'a, T>) -> Result<Self>;
+}

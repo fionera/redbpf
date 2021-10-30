@@ -35,9 +35,24 @@ fn forward_tcp(skb: SkBuff) -> SkBuffResult {
 }
 ```
 */
-pub mod prelude;
+pub mod prelude {
+    pub use cty::*;
 
-use crate::socket::SocketError;
+    pub use redbpf_macros::{program, socket_filter};
+
+    pub use crate::{
+        bindings::*,
+        helpers::*,
+        maps::*,
+        net::{socket::*, socket_filter::*},
+    };
+}
+
+use crate::net::error::Result;
+pub use crate::net::socket::SkBuff;
+
+/// Result type for socket filter programs.
+pub type SkBuffResult = Result<SkBuffAction>;
 
 /// The return type for successful socket filter programs.
 pub enum SkBuffAction {
@@ -49,7 +64,3 @@ pub enum SkBuffAction {
     /// via `Socket::recv`.
     SendToUserspace,
 }
-
-pub use crate::tc::prelude::SkBuff;
-/// Result type for socket filter programs.
-pub type SkBuffResult = Result<SkBuffAction, SocketError>;

@@ -102,6 +102,7 @@ tries to probe vmlinux from the well-known system paths and uses it
 */
 #![deny(clippy::all)]
 #![no_std]
+
 pub mod bindings;
 pub mod bpf_iter;
 pub mod helpers;
@@ -109,9 +110,4 @@ pub mod kprobe;
 pub mod maps;
 pub mod net;
 pub mod registers;
-pub mod socket;
-pub mod socket_filter;
-pub mod sockmap;
-pub mod tc;
 pub mod uprobe;
-pub mod xdp;

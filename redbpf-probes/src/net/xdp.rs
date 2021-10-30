@@ -24,7 +24,7 @@ use redbpf_probes::xdp::prelude::*;
 program!(0xFFFFFFFE, "GPL");
 
 #[xdp]
-fn block_port_80(ctx: XdpContext) -> XdpResult {
+fn block_port_80(ctx: XdpContext) -> Result<XdpAction> {
     let transport = ctx.transport()?;
     if transport.dest() == 80 {
         return Ok(XdpAction::Drop);
@@ -34,16 +34,41 @@ fn block_port_80(ctx: XdpContext) -> XdpResult {
 }
 ```
  */
-pub mod prelude;
 
-use crate::bindings::*;
-use crate::maps::{PerfMap as PerfMapBase, PerfMapFlags};
-use crate::net::{NetworkBuffer, NetworkResult};
+pub mod prelude {
+    //! The XDP Prelude
+    //!
+    //! The purpose of this module is to alleviate imports of the common XDP types
+    //! by adding a glob import to the top of XDP programs:
+    //!
+    //! ```
+    //! use redbpf_probes::net::xdp::prelude::*;
+    //! ```
+    pub use crate::bindings::*;
+    pub use crate::helpers::*;
+    pub use crate::maps::{HashMap, PerfMapFlags};
+    pub use crate::net::protocols::*;
+    pub use crate::net::xdp::*;
+    pub use crate::net::*;
+    pub use cty::*;
+    pub use redbpf_macros::{map, program, xdp};
+}
 
-/// The result type for XDP programs.
-pub type XdpResult = NetworkResult<XdpAction>;
+use core::{
+    any::{Any, TypeId},
+    marker::PhantomData,
+};
+
+use crate::{
+    bindings::*,
+    maps::{PerfMap as PerfMapBase, PerfMapFlags},
+    net::buf::{NetBuf, RawBuf, RawBufMut},
+};
+
+pub type XdpResult = Result<XdpAction, crate::net::error::Error>;
 
 /// The return type for successful XDP probes.
+#[derive(Copy, Clone)]
 #[repr(u32)]
 pub enum XdpAction {
     /// Signals that the program had an unexpected anomaly. Should only be used
@@ -65,33 +90,71 @@ pub enum XdpAction {
     Redirect = xdp_action_XDP_REDIRECT,
 }
 
+impl XdpAction {
+    #[inline(always)]
+    #[doc(hidden)]
+    pub fn from_any<T: Any>(other: &T) -> Self {
+        if TypeId::of::<T>() == TypeId::of::<XdpAction>() {
+            let value_any = other as &dyn Any;
+            if let Some(action) = value_any.downcast_ref::<XdpAction>() {
+                return *action;
+            }
+        }
+        XdpAction::Pass
+    }
+}
+
 /// Context object provided to XDP programs.
 ///
 /// XDP programs are passed a `XdpContext` instance as their argument. Through
 /// the context, programs can inspect, modify and redirect the underlying
 /// networking data.
-#[derive(Clone)]
 pub struct XdpContext {
     pub ctx: *mut xdp_md,
 }
 
 impl XdpContext {
-    /// Returns the raw `xdp_md` context passed by the kernel.
+    /// Returns the `xdp_md` context passed by the kernel.
     #[inline]
-    pub fn inner(&self) -> *mut xdp_md {
-        self.ctx
+    pub fn inner(&mut self) -> &mut xdp_md {
+        if let Some(ctx) = unsafe { self.ctx.as_mut() } {
+            return ctx;
+        }
+        panic!("*xdp_md is null")
+    }
+
+    /// Returns a [`NetBuf`][0] with the header offset set to `0` since this is
+    /// a clean slate data buffer with no knowledge of what type of data lives
+    /// inside.
+    #[inline(always)]
+    pub fn data<'a>(&'a mut self) -> NetBuf<'a, Self> {
+        NetBuf {
+            buf: self as *mut _,
+            nh_offset: 0,
+            _marker: PhantomData,
+        }
     }
 }
 
-impl NetworkBuffer for XdpContext {
-    fn data_start(&self) -> usize {
-        unsafe { (*self.ctx).data as usize }
+impl RawBuf for XdpContext {
+    #[inline(always)]
+    fn start(&self) -> usize {
+        if let Some(ctx) = unsafe { self.ctx.as_mut() } {
+            return ctx.data as usize;
+        }
+        panic!("*xdp_md is null")
     }
 
-    fn data_end(&self) -> usize {
-        unsafe { (*self.ctx).data_end as usize }
+    #[inline(always)]
+    fn end(&self) -> usize {
+        if let Some(ctx) = unsafe { self.ctx.as_mut() } {
+            return ctx.data_end as usize;
+        }
+        panic!("*xdp_md is null")
     }
 }
+
+impl RawBufMut for XdpContext {}
 
 /* NB: this needs to be kept in sync with redbpf::xdp::MapData */
 /// Convenience data type to exchange payload data.
@@ -145,7 +208,7 @@ impl<T> PerfMap<T> {
     /// `packet_size` specifies the number of bytes from the current packet that
     /// the kernel should append to the event data.
     #[inline]
-    pub fn insert(&mut self, ctx: &XdpContext, data: &MapData<T>) {
+    pub fn insert(&mut self, ctx: &mut XdpContext, data: &MapData<T>) {
         let size = data.size;
         self.0
             .insert_with_flags(ctx.inner(), data, PerfMapFlags::with_xdp_size(size))
@@ -156,7 +219,7 @@ impl<T> PerfMap<T> {
     #[inline]
     pub fn insert_with_flags(
         &mut self,
-        ctx: &XdpContext,
+        ctx: &mut XdpContext,
         data: &MapData<T>,
         mut flags: PerfMapFlags,
     ) {
