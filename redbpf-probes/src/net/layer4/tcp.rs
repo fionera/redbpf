@@ -48,6 +48,12 @@ impl<'a, T: RawBuf> Tcp<'a, T> {
 
     /// Returns the "data offset" (i.e. header length) in bytes
     #[inline]
+    pub fn bitfield(&self) -> u16 {
+        self.hdr._bitfield_1.get(0, 16) as u16
+    }
+
+    /// Returns the "data offset" (i.e. header length) in bytes
+    #[inline]
     pub fn doff(&self) -> u8 {
         self.hdr._bitfield_1.get(4, 4) as u8
     }
@@ -113,6 +119,12 @@ impl<'a, T: RawBuf> Tcp<'a, T> {
     #[inline]
     pub fn cwr(&self) -> bool {
         self.hdr._bitfield_1.get_bit(15)
+    }
+
+    /// Returns the checksum
+    #[inline]
+    pub fn check(&self) -> u16 {
+        self.hdr.check
     }
 }
 
@@ -221,6 +233,12 @@ where
     #[inline]
     pub fn set_cwr(&mut self) {
         self.hdr._bitfield_1.set_bit(15, true);
+    }
+
+    /// Sets the checksum
+    #[inline]
+    pub fn set_check(&mut self, val: u16) {
+        self.hdr.check = val;
     }
 }
 

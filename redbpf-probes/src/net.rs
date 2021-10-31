@@ -14,7 +14,7 @@ by
 to provide access to the network data.
  */
 
-mod buf;
+pub mod buf;
 pub mod error;
 mod layer2;
 mod layer3;

@@ -65,6 +65,7 @@ pub fn load(
                 )));
             }
         }
+        println!("loaded");
 
         // dump all the generated events on stdout
         tokio::spawn(async move {
